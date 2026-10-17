@@ -1,4 +1,4 @@
-// 文件: nwafu.js
+﻿// 文件: nwafu.js
 // ---------------------------------------------------------------------------
 // 学校：西北农林科技大学（NWAFU）
 // 系统：ehall 新版教务（金智 jwapp）→「我的本研课表」
@@ -17,10 +17,16 @@
 
 const APP_CODE = 'wdkbby';
 const URL_TERM = '/modules/jshkcb/dqxnxq.do';
+const URL_TERM_LIST = '/modules/jshkcb/xnxqcx.do';
 const URL_COURSE = '/modules/xskcb/cxxszhxqkb.do';
+const URL_CALENDAR = '/modules/xskcb/cxxljc.do';
+const URL_SECTIONS = '/modules/jshkcb/cxjcs.do';
 const ACTION_TERM = 'dqxnxq';
+const ACTION_TERM_LIST = 'xnxqcx';
 const ACTION_COURSE = 'cxxszhxqkb';
-const PORTAL_HINT = 'newehall.nwafu.edu.cn 新门户 →「我的课表」';
+const ACTION_CALENDAR = 'cxxljc';
+const ACTION_SECTIONS = 'cxjcs';
+const PORTAL_HINT = 'newehall.nwafu.edu.cn 新门户 →「我的本研课表」';
 
 const DEFAULT_TOTAL_WEEKS = 20;
 const MAX_TOTAL_WEEKS = 30;
@@ -158,6 +164,7 @@ function messageOf(response) {
 
 // ==================== 学年学期 ====================
 
+/** 当前学年学期（dqxnxq.do），用于学期列表的默认选中项 */
 async function fetchTerm() {
     const response = await api(URL_TERM, {});
     const rows = rowsOf(response, ACTION_TERM);
@@ -167,6 +174,109 @@ async function fetchTerm() {
     const dm = textOf(rows[0].DM);
     if (!dm) throw new Error('学年学期接口未返回学期代码');
     return { dm: dm, mc: textOf(rows[0].MC) };
+}
+
+/** 学期列表（xnxqcx.do，按学期代码降序 = 最新在前） */
+async function fetchTermList() {
+    const response = await api(URL_TERM_LIST, { '*order': '-DM' });
+    const rows = rowsOf(response, ACTION_TERM_LIST);
+    if (!rows || !rows.length) return [];
+    return sortTermsDesc(rows);
+}
+
+/** 规整学期行并降序排列 */
+function sortTermsDesc(rows) {
+    return (rows || [])
+        .map((row) => ({ dm: textOf(row && row.DM), mc: textOf(row && row.MC) }))
+        .filter((term) => term.dm)
+        .sort((a, b) => b.dm.localeCompare(a.dm));
+}
+
+/** 学期显示文本 */
+function termText(term) {
+    const mc = textOf(term && term.mc);
+    return mc || textOf(term && term.dm);
+}
+
+/** 默认选中当前学期；列表中找不到则选第一条 */
+function defaultTermIndex(list, currentDm) {
+    if (!Array.isArray(list) || !list.length) return -1;
+    const key = textOf(currentDm);
+    if (!key) return 0;
+    const index = list.findIndex((term) => term.dm === key);
+    return index >= 0 ? index : 0;
+}
+
+/**
+ * 让用户选择要导入的学期（官方 API：showSingleSelection）。
+ * 返回 { dm, mc }；用户取消返回 null。
+ */
+async function selectTerm() {
+    let list = [];
+    try {
+        list = await fetchTermList();
+    } catch (e) {
+        log('学期列表接口失败，退回当前学期: ' + e.message);
+    }
+
+    let currentDm = '';
+    try {
+        const current = await fetchTerm();
+        currentDm = current.dm;
+        if (!list.length) list = [current];
+    } catch (e) {
+        log('当前学期接口失败: ' + e.message);
+    }
+
+    if (!list.length) throw new Error('未能获取学期列表，请先登录教务并打开「我的本研课表」');
+    if (list.length === 1) return list[0];
+
+    const labels = list.map((term) => termText(term));
+    const selected = await window.shiguangBridgePromise.showSingleSelection(
+        '选择学期',
+        JSON.stringify(labels),
+        defaultTermIndex(list, currentDm)
+    );
+    if (selected === null || selected === undefined) return null;
+
+    const index = Number(selected);
+    if (!(index >= 0 && index < list.length)) return null;
+    return list[index];
+}
+
+/** "2026-2027-1" → { xn: "2026-2027", xq: "1" } */
+function termCodes(dm) {
+    const parts = textOf(dm).split('-');
+    if (parts.length < 3) return null;
+    const xn = parts[0] + '-' + parts[1];
+    const xq = parts[2];
+    if (!/^\d{4}-\d{4}$/.test(xn) || !/^\d+$/.test(xq)) return null;
+    return { xn: xn, xq: xq };
+}
+
+/**
+ * 校历：所选学期的开学日期 + 校历总周数
+ *   POST {ROOT}/sys/wdkbby/modules/xskcb/cxxljc.do  { XN, XQ }
+ *   rows[0].XQKSRQ → 开学日期；rows[0].ZZC → 校历总周数
+ * 取不到返回 null（不影响课程导入）。
+ */
+async function fetchTermCalendar(dm) {
+    const codes = termCodes(dm);
+    if (!codes) return null;
+
+    const response = await api(URL_CALENDAR, { XN: codes.xn, XQ: codes.xq });
+    const rows = rowsOf(response, ACTION_CALENDAR);
+    if (!rows || !rows.length) return null;
+
+    const rawDate = textOf(rows[0].XQKSRQ);
+    const startDate = /^\d{4}-\d{2}-\d{2}/.test(rawDate) ? rawDate.substring(0, 10) : '';
+    const totalWeeks = parseInt(textOf(rows[0].ZZC), 10);
+
+    if (!startDate && !(totalWeeks > 0)) return null;
+    return {
+        startDate: startDate,
+        totalWeeks: totalWeeks > 0 ? Math.min(totalWeeks, MAX_TOTAL_WEEKS) : 0
+    };
 }
 
 // ==================== 周次解析 ====================
@@ -411,7 +521,9 @@ function dateText(year, month, day) {
  *   夏令 05-01 ~ 09-30；冬令 10-01 ~ 次年 04-30
  * 只生成「当前时段 + 下一时段」两条规则，避免同一日期命中多条。
  */
-function buildComboSchedule(today) {
+function buildComboSchedule(today, winterSlots, summerSlots) {
+    const winter = winterSlots || SLOTS_WINTER;
+    const summer = summerSlots || SLOTS_SUMMER;
     const date = today || new Date();
     const year = date.getFullYear();
     const month = date.getMonth() + 1;
@@ -419,22 +531,91 @@ function buildComboSchedule(today) {
     let rules;
     if (month >= 5 && month <= 9) {
         rules = [
-            { name: '夏令作息', startDate: dateText(year, 5, 1), endDate: dateText(year, 9, 30), timeSlots: SLOTS_SUMMER },
-            { name: '冬令作息', startDate: dateText(year, 10, 1), endDate: dateText(year + 1, 4, 30), timeSlots: SLOTS_WINTER }
+            { name: '夏令作息', startDate: dateText(year, 5, 1), endDate: dateText(year, 9, 30), timeSlots: summer },
+            { name: '冬令作息', startDate: dateText(year, 10, 1), endDate: dateText(year + 1, 4, 30), timeSlots: winter }
         ];
     } else if (month >= 10) {
         rules = [
-            { name: '冬令作息', startDate: dateText(year, 10, 1), endDate: dateText(year + 1, 4, 30), timeSlots: SLOTS_WINTER },
-            { name: '夏令作息', startDate: dateText(year + 1, 5, 1), endDate: dateText(year + 1, 9, 30), timeSlots: SLOTS_SUMMER }
+            { name: '冬令作息', startDate: dateText(year, 10, 1), endDate: dateText(year + 1, 4, 30), timeSlots: winter },
+            { name: '夏令作息', startDate: dateText(year + 1, 5, 1), endDate: dateText(year + 1, 9, 30), timeSlots: summer }
         ];
     } else {
         rules = [
-            { name: '冬令作息', startDate: dateText(year - 1, 10, 1), endDate: dateText(year, 4, 30), timeSlots: SLOTS_WINTER },
-            { name: '夏令作息', startDate: dateText(year, 5, 1), endDate: dateText(year, 9, 30), timeSlots: SLOTS_SUMMER }
+            { name: '冬令作息', startDate: dateText(year - 1, 10, 1), endDate: dateText(year, 4, 30), timeSlots: winter },
+            { name: '夏令作息', startDate: dateText(year, 5, 1), endDate: dateText(year, 9, 30), timeSlots: summer }
         ];
     }
 
     return { name: '西北农林科技大学作息（冬令/夏令）', publicSchedules: rules };
+}
+
+/** 分钟数 → "HH:mm" */
+function hhmm(minutes) {
+    const hour = Math.floor(minutes / 60) % 24;
+    return pad2(hour) + ':' + pad2(minutes % 60);
+}
+
+/**
+ * 课程节次超出作息表时补足（45 分钟上课 + 10 分钟课间）。
+ * 正常学期不会触发（作息表 11 节），只有教务临时加节时兜底，避免课程引用不存在的节次。
+ */
+function extendSlots(base, maxSection) {
+    const slots = (base || []).map((slot) => ({
+        number: slot.number,
+        startTime: slot.startTime,
+        endTime: slot.endTime
+    }));
+    if (!slots.length) return slots;
+
+    const target = Math.min(Math.max(parseInt(maxSection, 10) || slots.length, slots.length), 20);
+    while (slots.length < target) {
+        const last = slots[slots.length - 1];
+        const parts = last.endTime.split(':');
+        const startMinutes = parseInt(parts[0], 10) * 60 + parseInt(parts[1], 10) + 10;
+        slots.push({
+            number: slots.length + 1,
+            startTime: hhmm(startMinutes),
+            endTime: hhmm(startMinutes + 45)
+        });
+    }
+    return slots;
+}
+
+/** 课程里出现的最大的结束节次 */
+function maxSectionOf(courses) {
+    let max = 0;
+    (courses || []).forEach((course) => {
+        const end = parseInt(course && course.endSection, 10);
+        if (end > max) max = end;
+    });
+    return max;
+}
+
+/**
+ * 节次结构（cxjcs.do）：上午 / 下午 / 晚上各几节。
+ * 仅用于日志核对硬编码作息是否过期，取不到不影响导入。
+ */
+async function fetchSectionLayout(dm) {
+    const codes = termCodes(dm);
+    if (!codes) return null;
+
+    const response = await api(URL_SECTIONS, { XN: codes.xn, XQ: codes.xq });
+    const rows = rowsOf(response, ACTION_SECTIONS);
+    if (!rows || !rows.length) return null;
+
+    const row = rows[0];
+    const morning = parseInt(textOf(row.SFJJ), 10) || 0;
+    const afternoon = parseInt(textOf(row.XFJJ), 10) || 0;
+    const evening = parseInt(textOf(row.WSJJ), 10) || 0;
+    return { morning: morning, afternoon: afternoon, evening: evening, total: morning + afternoon + evening };
+}
+
+/** 课表配置：优先用校历给的开学日期与总周数 */
+function buildCourseConfig(calendar, courseWeeks) {
+    const totalWeeks = (calendar && calendar.totalWeeks > 0) ? calendar.totalWeeks : courseWeeks;
+    const config = { semesterTotalWeeks: totalWeeks };
+    if (calendar && calendar.startDate) config.semesterStartDate = calendar.startDate;
+    return config;
 }
 
 // ==================== 保存 ====================
@@ -464,7 +645,8 @@ async function promptUserToStart() {
     const confirmed = await window.shiguangBridgePromise.showAlert(
         '导入确认',
         '将从西北农林科技大学「我的本研课表」导入课程与作息。\n'
-        + '请先登录 ' + PORTAL_HINT + '，再点击开始导入。',
+        + '请先登录 ' + PORTAL_HINT + '，再点击开始导入；\n'
+        + '导入时可选择要导入的学期（默认当前学期）。',
         '开始导入'
     );
     if (!confirmed) {
@@ -488,58 +670,109 @@ function computeTotalWeeks(courses, maxWeekBits) {
 }
 
 /** 编排整个导入流程：成功才发送结束信号 */
+/**
+ * 作息保存：先基础作息（冬令），再冬令/夏令组合方案。
+ * 官方要求 savePresetTimeSlots 必须先成功，否则 saveComboSchedule 会被拒绝。
+ */
+async function saveSchedule(winterSlots, summerSlots) {
+    try {
+        await window.shiguangBridgePromise.savePresetTimeSlots(JSON.stringify(winterSlots));
+        await window.shiguangBridgePromise.saveComboSchedule(
+            JSON.stringify(buildComboSchedule(new Date(), winterSlots, summerSlots))
+        );
+        return true;
+    } catch (e) {
+        log('作息导入失败（不影响课程）: ' + e.message);
+        return false;
+    }
+}
+
+/** 校历与会话信息：失败都不影响课程导入 */
+async function loadExtras(dm) {
+    let calendar = null;
+    try {
+        calendar = await fetchTermCalendar(dm);
+    } catch (e) {
+        log('校历接口失败（不影响导入）: ' + e.message);
+    }
+
+    let layout = null;
+    try {
+        layout = await fetchSectionLayout(dm);
+    } catch (e) {
+        log('节次结构接口失败: ' + e.message);
+    }
+    if (layout && layout.total > 0) {
+        log('教务节次结构：上午 ' + layout.morning + ' / 下午 ' + layout.afternoon
+            + ' / 晚上 ' + layout.evening + ' 节（合计 ' + layout.total + '）');
+    }
+    return calendar;
+}
+
+/** 编排整个导入流程（只做流程控制）：成功才发送结束信号 */
 async function runImportFlow() {
     try {
         if (!(await promptUserToStart())) return;
 
-        const term = await fetchTerm();
+        // 1) 选择学期（默认当前学期；已结束且下学期已公布时可选下学期）
+        const term = await selectTerm();
+        if (!term) {
+            toast('已取消导入');
+            return;
+        }
+        log('选中学期: ' + term.dm + ' / ' + termText(term));
+
+        // 2) 该学期课程 + 校历
         const fetched = await fetchCourses(term);
         const courses = mergeAndDistinctCourses(fetched.courses);
-        const totalWeeks = computeTotalWeeks(courses, fetched.maxWeekBits);
+        const calendar = await loadExtras(term.dm);
 
-        const configSaved = await saveConfig({ semesterTotalWeeks: totalWeeks });
-        if (!configSaved) {
+        // 3) 配置 → 课程
+        const config = buildCourseConfig(calendar, computeTotalWeeks(courses, fetched.maxWeekBits));
+        if (!(await saveConfig(config))) {
             toast('课表配置保存失败，导入终止');
             return;
         }
-
-        const coursesSaved = await saveCourses(courses);
-        if (!coursesSaved) {
+        if (!(await saveCourses(courses))) {
             toast('课程保存失败，导入终止');
             return;
         }
 
-        // 作息：先写基础作息（冬令），再写冬令/夏令组合方案
-        let scheduleImported = false;
-        try {
-            await window.shiguangBridgePromise.savePresetTimeSlots(JSON.stringify(SLOTS_WINTER));
-            await window.shiguangBridgePromise.saveComboSchedule(JSON.stringify(buildComboSchedule(new Date())));
-            scheduleImported = true;
-        } catch (e) {
-            log('作息导入失败（不影响课程）: ' + e.message);
+        // 4) 作息（节次超出作息表时自动补足）→ 组合作息
+        const maxSection = maxSectionOf(courses);
+        if (maxSection > SLOTS_WINTER.length) {
+            log('课程出现第 ' + maxSection + ' 节，作息自动补足到 ' + maxSection + ' 节');
         }
+        const winterSlots = extendSlots(SLOTS_WINTER, maxSection);
+        const summerSlots = extendSlots(SLOTS_SUMMER, maxSection);
+        const scheduleImported = await saveSchedule(winterSlots, summerSlots);
 
-        const termLabel = term.mc ? term.mc : '';
+        // 5) 完成
         toast(
             '导入成功：' + courses.length + ' 门课程'
             + (scheduleImported ? '，已写入冬令/夏令作息' : '，作息导入失败')
-            + (termLabel ? '（' + termLabel + '）' : '')
+            + (calendar && calendar.startDate ? '，开学 ' + calendar.startDate : '')
+            + '（' + termText(term) + '）'
         );
         window.shiguangBridge.notifyTaskCompletion();
     } catch (error) {
-        console.error('[NWAFU 课表适配] 导入失败:', error);
-        try {
-            await window.shiguangBridgePromise.showAlert(
-                '导入失败',
-                '导入失败：' + (error && error.message ? error.message : String(error))
-                + '\n\n请先登录 ' + PORTAL_HINT + '，打开课表页面后重试。',
-                '知道了'
-            );
-        } catch (e) {
-            toast('导入失败：' + (error && error.message ? error.message : String(error)));
-        }
+        await reportFailure(error);
     }
 }
 
+/** 失败提示：优先弹窗，弹窗不可用时退回 toast */
+async function reportFailure(error) {
+    const message = '导入失败：' + (error && error.message ? error.message : String(error));
+    console.error('[NWAFU 课表适配] ' + message);
+    try {
+        await window.shiguangBridgePromise.showAlert(
+            '导入失败',
+            message + '\n\n请先登录 ' + PORTAL_HINT + '，打开课表页面后重试。',
+            '知道了'
+        );
+    } catch (e) {
+        toast(message);
+    }
+}
 // 启动导入流程
 runImportFlow();
